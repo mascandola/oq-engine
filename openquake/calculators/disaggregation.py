@@ -20,7 +20,6 @@
 Disaggregation calculator core functionality
 """
 import logging
-import operator
 import numpy
 
 from openquake.baselib import parallel, hdf5
@@ -304,11 +303,9 @@ class DisaggregationCalculator(base.HazardCalculator):
         magi = numpy.searchsorted(self.bin_edges[0], dstore['rup/mag'][:]) - 1
         magi[magi == -1] = 0  # when the magnitude is on the edge
         totrups = len(magi)
-        logging.info('Reading {:_d} ruptures'.format(totrups))
-        rup_df = dstore.read_df('rup')
-        rup_df['magi'] = magi
-        totweight = rup_df['nsites'].sum()
+        totweight = dstore['rup/nsites'][:].sum()
         et_ids = dstore['et_ids'][:]
+        logging.info('Reading {:_d} ruptures'.format(totrups))
         rlzs_by_gsim = self.full_lt.get_rlzs_by_gsim_list(et_ids)
         G = max(len(rbg) for rbg in rlzs_by_gsim)
         maxw = 2 * 1024**3 / (16 * G * self.M)  # at max 2 GB
@@ -318,30 +315,33 @@ class DisaggregationCalculator(base.HazardCalculator):
         task_inputs = []
         U = 0
         smap = parallel.Starmap(compute_disagg, h5=self.datastore.hdf5)
-        for (grp_id, magi), df in rup_df.groupby(['grp_id', 'magi']):
-            logging.info('Found %s ruptures with grp_id=%d, magbin=%d',
-                         len(df), grp_id, magi)
-            trti = et_ids[grp_id][0] // num_eff_rlzs
-            trt = self.trts[trti]
-            cmaker = ContextMaker(
-                trt, rlzs_by_gsim[grp_id],
-                {'truncation_level': oq.truncation_level,
-                 'maximum_distance': oq.maximum_distance,
-                 'collapse_level': oq.collapse_level,
-                 'num_epsilon_bins': oq.num_epsilon_bins,
-                 'investigation_time': oq.investigation_time,
-                 'imtls': oq.imtls})
-            weight = df['nsites'].sum()
-            sz = weight // maxweight
-            slices = split_in_slices(len(df), sz) if sz > 1 else [slice(None)]
-            for slc in slices:
-                block = df[slc]
-                U = max(U, block['nsites'].sum())
-                smap.submit((dstore, block, cmaker,
-                             self.hmap4, trti, magi, self.bin_edges))
-                task_inputs.append((trti, magi, len(block)))
+        for rupslice in split_in_slices(totrups, numpy.ceil(totrups / 1E6)):
+            rup_df = dstore.read_df('rup', slc=rupslice)
+            rup_df['magbin'] = magi[rupslice]
+            for (grp_id, magbin), df in rup_df.groupby(['grp_id', 'magbin']):
+                logging.info('Found %s ruptures with grp_id=%d, magbin=%d',
+                             len(df), grp_id, magbin)
+                trti = et_ids[grp_id][0] // num_eff_rlzs
+                trt = self.trts[trti]
+                cmaker = ContextMaker(
+                    trt, rlzs_by_gsim[grp_id],
+                    {'truncation_level': oq.truncation_level,
+                     'maximum_distance': oq.maximum_distance,
+                     'collapse_level': oq.collapse_level,
+                     'num_epsilon_bins': oq.num_epsilon_bins,
+                     'investigation_time': oq.investigation_time,
+                     'imtls': oq.imtls})
+                weight = df['nsites'].sum()
+                sz = weight // maxweight
+                slices = (split_in_slices(len(df), sz) if sz > 1
+                          else [slice(None)])
+                for slc in slices:
+                    block = df[slc]
+                    U = max(U, block['nsites'].sum())
+                    smap.submit((dstore, block, cmaker,
+                                 self.hmap4, trti, magbin, self.bin_edges))
+                    task_inputs.append((trti, magbin, len(block)))
 
-        del rup_df
         nbytes, msg = get_nbytes_msg(dict(M=self.M, G=G, U=U, F=2))
         logging.info('Maximum mean_std per task:\n%s', msg)
 
@@ -359,7 +359,6 @@ class DisaggregationCalculator(base.HazardCalculator):
         sd.pop('tasks')
         dt = numpy.dtype([('trti', U8), ('mag', '|S4'), ('nrups', U32)])
         self.datastore['disagg_task'] = numpy.array(task_inputs, dt)
-        #self.datastore.swmr_on()
         results = smap.reduce(self.agg_result, AccumDict(accum={}))
         return results  # imti, sid -> trti, magi -> 6D array
 
