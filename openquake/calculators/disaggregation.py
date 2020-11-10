@@ -25,7 +25,7 @@ import numpy
 
 from openquake.baselib import parallel, hdf5
 from openquake.baselib.general import (
-    AccumDict, get_nbytes_msg, humansize, pprod, agg_probs, block_splitter)
+    AccumDict, get_nbytes_msg, humansize, pprod, agg_probs, split_in_slices)
 from openquake.baselib.python3compat import encode
 from openquake.hazardlib import stats
 from openquake.hazardlib.calc import disagg
@@ -93,17 +93,15 @@ def output(mat6):
     return pprod(mat6, axis=(1, 2)), pprod(mat6, axis=(0, 3))
 
 
-def compute_disagg(dstore, magi, idxs, cmaker, hmap4, trti, bin_edges,
+def compute_disagg(dstore, rup_df, cmaker, hmap4, trti, magi, bin_edges,
                    monitor):
     # see https://bugs.launchpad.net/oq-engine/+bug/1279247 for an explanation
     # of the algorithm used
     """
     :param dstore:
         a DataStore instance
-    :param magi:
-        a magnitude index
-    :param idxs:
-        an array of rupture indices
+    :param rup_df:
+        a rupture DataFrame
     :param cmaker:
         a :class:`openquake.hazardlib.gsim.base.ContextMaker` instance
     :param hmap4:
@@ -124,7 +122,7 @@ def compute_disagg(dstore, magi, idxs, cmaker, hmap4, trti, bin_edges,
     with monitor('reading contexts', measuremem=True):
         dstore.open('r')
         ctxs, close_ctxs = read_ctxs(
-            dstore, idxs, req_site_params=cmaker.REQUIRES_SITES_PARAMETERS)
+            dstore, rup_df, req_site_params=cmaker.REQUIRES_SITES_PARAMETERS)
 
     dis_mon = monitor('disaggregate', measuremem=False)
     ms_mon = monitor('disagg mean_std', measuremem=True)
@@ -307,17 +305,10 @@ class DisaggregationCalculator(base.HazardCalculator):
         magi[magi == -1] = 0  # when the magnitude is on the edge
         totrups = len(magi)
         logging.info('Read {:_d} ruptures'.format(totrups))
-        rdt = [('grp_id', U16), ('magi', U8), ('nsites', U16), ('idx', U32)]
-        rdata = numpy.zeros(totrups, rdt)
-        rdata['magi'] = magi
-        rdata['idx'] = numpy.arange(totrups)
-        rdata['grp_id'] = dstore['rup/grp_id'][:]
-        rdata['nsites'] = dstore['rup/nsites'][:]
-        rdata.sort(order=['grp_id', 'magi'])
-        blocks = len(numpy.unique(rdata[['grp_id', 'magi']]))
-        logging.info('There are %d combinations (grp_id, magi)', blocks)
+        rup_df = dstore.read_df('rup')
+        rup_df['magi'] = magi
         allargs = []
-        totweight = rdata['nsites'].sum()
+        totweight = rup_df['nsites'].sum()
         et_ids = dstore['et_ids'][:]
         rlzs_by_gsim = self.full_lt.get_rlzs_by_gsim_list(et_ids)
         G = max(len(rbg) for rbg in rlzs_by_gsim)
@@ -327,11 +318,7 @@ class DisaggregationCalculator(base.HazardCalculator):
         num_eff_rlzs = len(self.full_lt.sm_rlzs)
         task_inputs = []
         U = 0
-        for block in block_splitter(rdata, maxweight,
-                                    operator.itemgetter('nsites'),
-                                    operator.itemgetter('grp_id', 'magi')):
-            grp_id = block[0]['grp_id']
-            magi = block[0]['magi']
+        for (grp_id, magi), df in rup_df.groupby(['grp_id', 'magi']):
             trti = et_ids[grp_id][0] // num_eff_rlzs
             trt = self.trts[trti]
             cmaker = ContextMaker(
@@ -342,11 +329,16 @@ class DisaggregationCalculator(base.HazardCalculator):
                  'num_epsilon_bins': oq.num_epsilon_bins,
                  'investigation_time': oq.investigation_time,
                  'imtls': oq.imtls})
-            U = max(U, block.weight)
-            idxs = numpy.sort([rec['idx'] for rec in block])
-            allargs.append((dstore, magi, idxs, cmaker,
-                            self.hmap4, trti, self.bin_edges))
-            task_inputs.append((trti, magi, len(idxs)))
+            weight = df['nsites'].sum()
+            sz = weight // maxweight
+            print('============', grp_id, magi, weight, sz)
+            slices = split_in_slices(len(df), sz) if sz > 1 else [slice(None)]
+            for slc in slices:
+                block = df[slc]
+                U = max(U, block['nsites'].sum())
+                allargs.append((dstore, block, cmaker,
+                                self.hmap4, trti, magi, self.bin_edges))
+                task_inputs.append((trti, magi, len(block)))
 
         nbytes, msg = get_nbytes_msg(dict(M=self.M, G=G, U=U, F=2))
         logging.info('Maximum mean_std per task:\n%s', msg)
