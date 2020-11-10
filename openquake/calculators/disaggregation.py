@@ -307,7 +307,6 @@ class DisaggregationCalculator(base.HazardCalculator):
         logging.info('Reading {:_d} ruptures'.format(totrups))
         rup_df = dstore.read_df('rup')
         rup_df['magi'] = magi
-        allargs = []
         totweight = rup_df['nsites'].sum()
         et_ids = dstore['et_ids'][:]
         rlzs_by_gsim = self.full_lt.get_rlzs_by_gsim_list(et_ids)
@@ -318,6 +317,7 @@ class DisaggregationCalculator(base.HazardCalculator):
         num_eff_rlzs = len(self.full_lt.sm_rlzs)
         task_inputs = []
         U = 0
+        smap = parallel.Starmap(compute_disagg, h5=self.datastore.hdf5)
         for (grp_id, magi), df in rup_df.groupby(['grp_id', 'magi']):
             logging.info('Found %s ruptures with grp_id=%d, magbin=%d',
                          len(df), grp_id, magi)
@@ -337,8 +337,8 @@ class DisaggregationCalculator(base.HazardCalculator):
             for slc in slices:
                 block = df[slc]
                 U = max(U, block['nsites'].sum())
-                allargs.append((dstore, block, cmaker,
-                                self.hmap4, trti, magi, self.bin_edges))
+                smap.submit((dstore, block, cmaker,
+                             self.hmap4, trti, magi, self.bin_edges))
                 task_inputs.append((trti, magi, len(block)))
 
         del rup_df
@@ -348,7 +348,7 @@ class DisaggregationCalculator(base.HazardCalculator):
         s = self.shapedic
         sd = dict(N=s['N'], M=s['M'], P=s['P'], Z=s['Z'], D=s['dist'],
                   E=s['eps'], Lo=s['lon'], La=s['lat'])
-        sd['tasks'] = numpy.ceil(len(allargs))
+        sd['tasks'] = numpy.ceil(len(task_inputs))
         nbytes, msg = get_nbytes_msg(sd)
         if nbytes > oq.max_data_transfer:
             raise ValueError(
@@ -359,9 +359,7 @@ class DisaggregationCalculator(base.HazardCalculator):
         sd.pop('tasks')
         dt = numpy.dtype([('trti', U8), ('mag', '|S4'), ('nrups', U32)])
         self.datastore['disagg_task'] = numpy.array(task_inputs, dt)
-        self.datastore.swmr_on()
-        smap = parallel.Starmap(
-            compute_disagg, allargs, h5=self.datastore.hdf5)
+        #self.datastore.swmr_on()
         results = smap.reduce(self.agg_result, AccumDict(accum={}))
         return results  # imti, sid -> trti, magi -> 6D array
 
