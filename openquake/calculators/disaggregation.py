@@ -305,22 +305,21 @@ class DisaggregationCalculator(base.HazardCalculator):
         totrups = len(magi)
         totweight = dstore['rup/nsites'][:].sum()
         et_ids = dstore['et_ids'][:]
-        logging.info('Reading {:_d} ruptures'.format(totrups))
         rlzs_by_gsim = self.full_lt.get_rlzs_by_gsim_list(et_ids)
         G = max(len(rbg) for rbg in rlzs_by_gsim)
         maxw = 2 * 1024**3 / (16 * G * self.M)  # at max 2 GB
-        maxweight = min(
-            numpy.ceil(totweight / (oq.concurrent_tasks or 1)), maxw)
+        maxweight = int(
+            min(numpy.ceil(totweight / (oq.concurrent_tasks or 1)), maxw))
+        logging.info('Reading {:_d} ruptures with totweight={:_d}, '
+                     'maxweight={:_d}'.format(totrups, totweight, maxweight))
         num_eff_rlzs = len(self.full_lt.sm_rlzs)
         task_inputs = []
         U = 0
         smap = parallel.Starmap(compute_disagg, h5=self.datastore.hdf5)
-        for rupslice in split_in_slices(totrups, numpy.ceil(totrups / 1E6)):
+        for rupslice in split_in_slices(totrups, numpy.ceil(totrups / 1E5)):
             rup_df = dstore.read_df('rup', slc=rupslice)
             rup_df['magbin'] = magi[rupslice]
             for (grp_id, magbin), df in rup_df.groupby(['grp_id', 'magbin']):
-                logging.info('Found %s ruptures with grp_id=%d, magbin=%d',
-                             len(df), grp_id, magbin)
                 trti = et_ids[grp_id][0] // num_eff_rlzs
                 trt = self.trts[trti]
                 cmaker = ContextMaker(
@@ -335,6 +334,8 @@ class DisaggregationCalculator(base.HazardCalculator):
                 sz = weight // maxweight
                 slices = (split_in_slices(len(df), sz) if sz > 1
                           else [slice(None)])
+                logging.info('Sending %s ruptures [grp_id=%d, magbin=%d] in %d'
+                             ' task(s)', len(df), grp_id, magbin, len(slices))
                 for slc in slices:
                     block = df[slc]
                     U = max(U, block['nsites'].sum())
