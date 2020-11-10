@@ -304,7 +304,7 @@ class DisaggregationCalculator(base.HazardCalculator):
         magi = numpy.searchsorted(self.bin_edges[0], dstore['rup/mag'][:]) - 1
         magi[magi == -1] = 0  # when the magnitude is on the edge
         totrups = len(magi)
-        logging.info('Read {:_d} ruptures'.format(totrups))
+        logging.info('Reading {:_d} ruptures'.format(totrups))
         rup_df = dstore.read_df('rup')
         rup_df['magi'] = magi
         allargs = []
@@ -319,6 +319,8 @@ class DisaggregationCalculator(base.HazardCalculator):
         task_inputs = []
         U = 0
         for (grp_id, magi), df in rup_df.groupby(['grp_id', 'magi']):
+            logging.info('Found %s ruptures with grp_id=%d, magbin=%d',
+                         len(df), grp_id, magi)
             trti = et_ids[grp_id][0] // num_eff_rlzs
             trt = self.trts[trti]
             cmaker = ContextMaker(
@@ -331,7 +333,6 @@ class DisaggregationCalculator(base.HazardCalculator):
                  'imtls': oq.imtls})
             weight = df['nsites'].sum()
             sz = weight // maxweight
-            print('============', grp_id, magi, weight, sz)
             slices = split_in_slices(len(df), sz) if sz > 1 else [slice(None)]
             for slc in slices:
                 block = df[slc]
@@ -340,6 +341,7 @@ class DisaggregationCalculator(base.HazardCalculator):
                                 self.hmap4, trti, magi, self.bin_edges))
                 task_inputs.append((trti, magi, len(block)))
 
+        del rup_df
         nbytes, msg = get_nbytes_msg(dict(M=self.M, G=G, U=U, F=2))
         logging.info('Maximum mean_std per task:\n%s', msg)
 
